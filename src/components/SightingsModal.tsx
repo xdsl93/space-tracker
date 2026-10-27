@@ -1,18 +1,26 @@
 import {
+  Bell,
+  BellRing,
   CalendarClock,
   Check,
+  ChevronDown,
+  ChevronUp,
   Compass,
   Eye,
   Filter,
+  Loader2,
   MapPin,
   Moon,
   Navigation,
   Radio,
+  Search,
   Sparkles,
   Sun,
   X,
 } from 'lucide-react';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useLanguage } from '../i18n/LanguageContext';
 import { latLonToMaidenhead, predictUpcomingPasses } from '../services/orbitalEngine';
 import {
   SatellitePass,
@@ -29,6 +37,19 @@ interface SightingsModalProps {
   isLocating: boolean;
   onRequestGps: () => void;
   onSetManualLocation: (lat: number, lon: number, label?: string) => void;
+  scheduledPassIds: string[];
+  onTogglePassReminder: (pass: SatellitePass) => Promise<boolean>;
+  onOpenNotificationsModal: () => void;
+}
+
+interface GeocodedCity {
+  id: number;
+  name: string;
+  latitude: number;
+  longitude: number;
+  country?: string;
+  admin1?: string;
+  elevation?: number;
 }
 
 const PRESET_LOCATIONS = [
@@ -47,23 +68,6 @@ const PRESET_LOCATIONS = [
   { name: 'Tokyo, JP', lat: 35.6762, lon: 139.6503 },
 ];
 
-function azimuthToCompass(deg: number): string {
-  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-  return dirs[Math.round(deg / 45) % 8];
-}
-
-function formatTimeUntil(target: Date): string {
-  const diffMs = target.getTime() - Date.now();
-  if (diffMs <= 0) return 'In corso ora!';
-  const totalMin = Math.floor(diffMs / 60000);
-  const days = Math.floor(totalMin / 1440);
-  const hours = Math.floor((totalMin % 1440) / 60);
-  const mins = totalMin % 60;
-  if (days > 0) return `tra ${days}g ${hours}h`;
-  if (hours > 0) return `tra ${hours}h ${mins}m`;
-  return `tra ${mins} min`;
-}
-
 export const SightingsModal: React.FC<SightingsModalProps> = ({
   isOpen,
   onClose,
@@ -72,17 +76,40 @@ export const SightingsModal: React.FC<SightingsModalProps> = ({
   isLocating,
   onRequestGps,
   onSetManualLocation,
+  scheduledPassIds,
+  onTogglePassReminder,
+  onOpenNotificationsModal,
 }) => {
+  const {
+    t,
+    formatTime,
+    formatDate,
+    getCompassDirection,
+    formatTimeUntil,
+    language,
+  } = useLanguage();
+
   const [latInput, setLatInput] = useState(userLocation.lat.toFixed(4));
   const [lonInput, setLonInput] = useState(userLocation.lon.toFixed(4));
   const [customLabel, setCustomLabel] = useState(userLocation.label);
 
-  // Filters for pass prediction
-  const [hoursAhead, setHoursAhead] = useState<number>(72); // Default 3 days
+  // City Search Autocomplete state (Open-Meteo Public Geocoding API)
+  const [cityQuery, setCityQuery] = useState('');
+  const [citySuggestions, setCitySuggestions] = useState<GeocodedCity[]>([]);
+  const [isSearchingCities, setIsSearchingCities] = useState(false);
+  const [showDropdown, setShowDropdown] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  const [hoursAhead, setHoursAhead] = useState<number>(72);
   const [minElevation, setMinElevation] = useState<number>(10);
   const [stationFilter, setStationFilter] = useState<'all' | StationId>('all');
   const [visibilityFilter, setVisibilityFilter] = useState<'all' | 'naked_eye' | 'sunlit'>('all');
   const [justUpdatedFeedback, setJustUpdatedFeedback] = useState(false);
+
+  const [isPassListOpen, setIsPassListOpen] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 768 : false
+  );
+  const [expandedPassId, setExpandedPassId] = useState<string | null>(null);
 
   useEffect(() => {
     setLatInput(userLocation.lat.toFixed(4));
@@ -90,7 +117,63 @@ export const SightingsModal: React.FC<SightingsModalProps> = ({
     setCustomLabel(userLocation.label);
   }, [userLocation.lat, userLocation.lon, userLocation.label]);
 
-  // Dynamically recompute passes whenever location, horizon or minElevation changes
+  // Prevent background body scroll when modal is open
+  useEffect(() => {
+    if (!isOpen) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [isOpen]);
+
+  // Close autocomplete dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setShowDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Debounced public API call to Open-Meteo Geocoding API
+  useEffect(() => {
+    const trimmed = cityQuery.trim();
+    if (trimmed.length < 2) {
+      setCitySuggestions([]);
+      setIsSearchingCities(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      setIsSearchingCities(true);
+      try {
+        const langCode = language === 'it' ? 'it' : 'en';
+        const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
+          trimmed
+        )}&count=8&language=${langCode}&format=json`;
+        const res = await fetch(url, { signal: controller.signal });
+        if (res.ok) {
+          const data = await res.json();
+          setCitySuggestions(data.results || []);
+          setShowDropdown(true);
+        }
+      } catch {
+        // Ignore abort or network errors
+      } finally {
+        setIsSearchingCities(false);
+      }
+    }, 280);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [cityQuery, language]);
+
   const computedPasses = useMemo<SatellitePass[]>(() => {
     if (!isOpen) return [];
     const start = new Date();
@@ -125,18 +208,23 @@ export const SightingsModal: React.FC<SightingsModalProps> = ({
 
   const userQth = latLonToMaidenhead(userLocation.lat, userLocation.lon);
 
+  const triggerUpdatedBadge = () => {
+    setJustUpdatedFeedback(true);
+    setTimeout(() => setJustUpdatedFeedback(false), 2500);
+  };
+
   const handleApplyManualCoords = (e: React.FormEvent) => {
     e.preventDefault();
     const parsedLat = parseFloat(latInput);
     const parsedLon = parseFloat(lonInput);
     if (!Number.isNaN(parsedLat) && !Number.isNaN(parsedLon)) {
+      const manualWord = language === 'it' ? 'Manuale' : 'Manual';
       const labelToUse =
         customLabel && customLabel !== userLocation.label
           ? customLabel
-          : `Manuale (${parsedLat.toFixed(2)}°, ${parsedLon.toFixed(2)}°)`;
+          : `${manualWord} (${parsedLat.toFixed(2)}°, ${parsedLon.toFixed(2)}°)`;
       onSetManualLocation(parsedLat, parsedLon, labelToUse);
-      setJustUpdatedFeedback(true);
-      setTimeout(() => setJustUpdatedFeedback(false), 2000);
+      triggerUpdatedBadge();
     }
   };
 
@@ -145,68 +233,80 @@ export const SightingsModal: React.FC<SightingsModalProps> = ({
     setLonInput(city.lon.toFixed(4));
     setCustomLabel(city.name);
     onSetManualLocation(city.lat, city.lon, city.name);
-    setJustUpdatedFeedback(true);
-    setTimeout(() => setJustUpdatedFeedback(false), 2000);
+    triggerUpdatedBadge();
+  };
+
+  const handleSelectGeocodedCity = (city: GeocodedCity) => {
+    const regionPart = city.admin1 ? `, ${city.admin1}` : '';
+    const countryPart = city.country ? ` (${city.country})` : '';
+    const fullLabel = `${city.name}${regionPart}${countryPart}`;
+
+    setLatInput(city.latitude.toFixed(4));
+    setLonInput(city.longitude.toFixed(4));
+    setCustomLabel(fullLabel);
+    setCityQuery(fullLabel);
+    setShowDropdown(false);
+
+    onSetManualLocation(city.latitude, city.longitude, fullLabel);
+    triggerUpdatedBadge();
   };
 
   const nakedEyeCount = computedPasses.filter((p) => p.isVisuallyObservable).length;
 
-  return (
+  const modalContent = (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-2 sm:p-4 overflow-y-auto"
+      className="fixed inset-0 z-[9999] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-6"
+      style={{
+        paddingTop: 'max(1rem, env(safe-area-inset-top))',
+        paddingBottom: 'max(1rem, env(safe-area-inset-bottom))',
+      }}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-5xl max-h-[92vh] flex flex-col rounded-2xl bg-[#070d1f] border border-slate-700/90 shadow-2xl overflow-hidden"
+        className="w-full max-w-4xl max-h-[85dvh] sm:max-h-[88vh] flex flex-col rounded-2xl bg-[#070d1f] border border-slate-700/90 shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Modal Header */}
-        <div className="flex items-center justify-between px-4 sm:px-6 py-4 bg-slate-950/90 border-b border-slate-800">
-          <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-xl bg-gradient-to-br from-emerald-500/20 to-cyan-500/20 border border-emerald-400/40">
-              <CalendarClock className="w-5 h-5 text-emerald-400" />
+        {/* 1. Fixed Modal Header */}
+        <div className="flex items-center justify-between px-4 sm:px-6 py-3.5 bg-slate-950 border-b border-slate-800 shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="p-2 rounded-xl bg-gradient-to-br from-emerald-500/20 to-cyan-500/20 border border-emerald-400/40 shrink-0">
+              <MapPin className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-400" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-base sm:text-lg font-bold text-white">
-                  Calendario Prossimi Avvistamenti &amp; Finestre Orarie
-                </h2>
-                <span className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                  RICALCOLO SGP4 ISTANTANEO
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Cambia la tua posizione (GPS o manuale) per ricalcolare in tempo reale gli orari di passaggio di ISS e Tiangong
+            <div className="min-w-0">
+              <h2 className="text-sm sm:text-lg font-bold text-white truncate">
+                {t.sightings.title}
+              </h2>
+              <p className="text-[11px] sm:text-xs text-slate-400 truncate">
+                {t.sightings.subtitle}
               </p>
             </div>
           </div>
 
           <button
+            type="button"
             onClick={onClose}
-            className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-700/80 transition"
-            title="Chiudi modale"
+            className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700 transition shrink-0"
+            title={t.sightings.closeModal}
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Modal Body (Scrollable) */}
-        <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-5">
-          {/* Top Panel: Interactive Location Editor & Presets */}
-          <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-4 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <MapPin className="w-4 h-4 text-emerald-400" />
-                <span className="text-xs sm:text-sm font-bold text-white">
-                  Posizione di Osservazione Attiva:
-                </span>
-                <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-mono text-xs font-bold">
-                  {userLocation.label} ({userLocation.lat.toFixed(3)}°, {userLocation.lon.toFixed(3)}°) • QTH {userQth}
+        {/* 2. Scrollable Modal Body */}
+        <div className="flex-1 overflow-y-auto overscroll-contain p-3.5 sm:p-6 space-y-4">
+          {/* Location Configuration Card */}
+          <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-3.5 sm:p-4 space-y-3.5">
+            {/* Active Location Banner + GPS Button */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-xs font-bold text-slate-300">{t.sightings.active}</span>
+                <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-mono text-[11px] font-bold">
+                  {userLocation.label} ({userLocation.lat.toFixed(2)}°, {userLocation.lon.toFixed(2)}°) • QTH {userQth}
                 </span>
                 {justUpdatedFeedback && (
-                  <span className="inline-flex items-center gap-1 text-xs font-mono text-cyan-300 animate-pulse">
+                  <span className="inline-flex items-center gap-1 text-[11px] font-mono text-cyan-300 animate-pulse">
                     <Check className="w-3.5 h-3.5" />
-                    Finestre orarie aggiornate!
+                    {t.sightings.locationUpdated}
                   </span>
                 )}
               </div>
@@ -215,77 +315,82 @@ export const SightingsModal: React.FC<SightingsModalProps> = ({
                 type="button"
                 onClick={onRequestGps}
                 disabled={isLocating}
-                className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center gap-1.5 transition shadow-md shadow-emerald-600/20"
+                className="w-full sm:w-auto px-3 py-2 sm:py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition shadow-md shadow-emerald-600/20"
               >
                 <Navigation className="w-3.5 h-3.5" />
-                <span>{isLocating ? 'Rilevamento GPS...' : 'Usa Posizione GPS Attuale'}</span>
+                <span>{isLocating ? t.sightings.locatingGps : t.sightings.useGps}</span>
               </button>
             </div>
 
-            {/* Manual Coordinates Form */}
-            <form
-              onSubmit={handleApplyManualCoords}
-              className="grid grid-cols-1 sm:grid-cols-12 gap-3 pt-2 border-t border-slate-800/80 items-end"
-            >
-              <div className="sm:col-span-3">
-                <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                  Latitudine (-90° / +90°)
-                </label>
-                <input
-                  type="number"
-                  step="any"
-                  min={-90}
-                  max={90}
-                  value={latInput}
-                  onChange={(e) => setLatInput(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:border-cyan-400 focus:outline-none"
-                  placeholder="es. 41.9028"
-                />
-              </div>
-
-              <div className="sm:col-span-3">
-                <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                  Longitudine (-180° / +180°)
-                </label>
-                <input
-                  type="number"
-                  step="any"
-                  min={-180}
-                  max={180}
-                  value={lonInput}
-                  onChange={(e) => setLonInput(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:border-cyan-400 focus:outline-none"
-                  placeholder="es. 12.4964"
-                />
-              </div>
-
-              <div className="sm:col-span-3">
-                <label className="block text-[11px] font-mono text-slate-400 mb-1">
-                  Nome Località (Opzionale)
-                </label>
+            {/* City Search Autocomplete Dropdown (Open-Meteo Public Geocoding API) */}
+            <div ref={dropdownRef} className="relative pt-2 border-t border-slate-800/80">
+              <label className="block text-[11px] font-mono text-cyan-300 font-semibold mb-1.5">
+                {t.sightings.searchCities}
+              </label>
+              <div className="relative flex items-center">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 pointer-events-none" />
                 <input
                   type="text"
-                  value={customLabel}
-                  onChange={(e) => setCustomLabel(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:border-cyan-400 focus:outline-none"
-                  placeholder="es. Osservatorio Casa"
+                  value={cityQuery}
+                  onFocus={() => {
+                    if (citySuggestions.length > 0) setShowDropdown(true);
+                  }}
+                  onChange={(e) => setCityQuery(e.target.value)}
+                  placeholder={t.sightings.searchPlaceholder}
+                  className="w-full pl-9 pr-9 py-2 rounded-xl bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/30 focus:outline-none"
                 />
+                {isSearchingCities && (
+                  <Loader2 className="w-4 h-4 text-cyan-400 animate-spin absolute right-3" />
+                )}
+                {!isSearchingCities && cityQuery && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCityQuery('');
+                      setCitySuggestions([]);
+                      setShowDropdown(false);
+                    }}
+                    className="absolute right-2.5 p-1 text-slate-400 hover:text-white"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
 
-              <div className="sm:col-span-3">
-                <button
-                  type="submit"
-                  className="w-full py-1.5 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition shadow-md shadow-cyan-500/20"
-                >
-                  Aggiorna Posizione &amp; Orari
-                </button>
-              </div>
-            </form>
+              {/* Autocomplete Suggestions Dropdown List */}
+              {showDropdown && citySuggestions.length > 0 && (
+                <div className="absolute left-0 right-0 mt-1.5 z-50 rounded-xl bg-slate-950 border border-cyan-500/50 shadow-2xl max-h-56 overflow-y-auto divide-y divide-slate-800/80">
+                  {citySuggestions.map((city) => (
+                    <button
+                      key={city.id}
+                      type="button"
+                      onClick={() => handleSelectGeocodedCity(city)}
+                      className="w-full px-3.5 py-2.5 text-left hover:bg-cyan-500/15 flex items-center justify-between gap-2 transition"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-white truncate">
+                          {city.name}
+                          {city.admin1 ? (
+                            <span className="font-normal text-slate-400">, {city.admin1}</span>
+                          ) : null}
+                        </div>
+                        <div className="text-[10px] font-mono text-slate-400">
+                          {city.country || ''}
+                        </div>
+                      </div>
+                      <div className="text-[11px] font-mono text-cyan-300 shrink-0">
+                        {city.latitude.toFixed(2)}°, {city.longitude.toFixed(2)}°
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
 
             {/* Quick City Presets */}
             <div className="space-y-1.5">
-              <div className="text-[11px] text-slate-400 font-mono">
-                Scelta rapida città (clicca per ricalcolare subito le finestre di avvistamento):
+              <div className="text-[10px] sm:text-[11px] text-slate-400 font-mono">
+                {t.sightings.quickCities}
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {PRESET_LOCATIONS.map((city) => {
@@ -309,281 +414,472 @@ export const SightingsModal: React.FC<SightingsModalProps> = ({
                 })}
               </div>
             </div>
+
+            {/* Manual Coordinates Form */}
+            <form
+              onSubmit={handleApplyManualCoords}
+              className="grid grid-cols-2 sm:grid-cols-12 gap-2.5 pt-2 border-t border-slate-800/80 items-end"
+            >
+              <div className="col-span-1 sm:col-span-3">
+                <label className="block text-[10px] sm:text-[11px] font-mono text-slate-400 mb-1">
+                  {t.sightings.latitude}
+                </label>
+                <input
+                  type="number"
+                  step="any"
+                  min={-90}
+                  max={90}
+                  value={latInput}
+                  onChange={(e) => setLatInput(e.target.value)}
+                  className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:border-cyan-400 focus:outline-none"
+                />
+              </div>
+
+              <div className="col-span-1 sm:col-span-3">
+                <label className="block text-[10px] sm:text-[11px] font-mono text-slate-400 mb-1">
+                  {t.sightings.longitude}
+                </label>
+                <input
+                  type="number"
+                  step="any"
+                  min={-180}
+                  max={180}
+                  value={lonInput}
+                  onChange={(e) => setLonInput(e.target.value)}
+                  className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:border-cyan-400 focus:outline-none"
+                />
+              </div>
+
+              <div className="col-span-2 sm:col-span-3">
+                <label className="block text-[10px] sm:text-[11px] font-mono text-slate-400 mb-1">
+                  {t.sightings.locationName}
+                </label>
+                <input
+                  type="text"
+                  value={customLabel}
+                  onChange={(e) => setCustomLabel(e.target.value)}
+                  className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:border-cyan-400 focus:outline-none"
+                />
+              </div>
+
+              <div className="col-span-2 sm:col-span-3">
+                <button
+                  type="submit"
+                  className="w-full py-2 sm:py-1.5 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition shadow-md shadow-cyan-500/20"
+                >
+                  {t.sightings.saveCoordinates}
+                </button>
+              </div>
+            </form>
           </div>
 
-          {/* Filter Bar: Station, Visibility Type, Time Window, Min Elevation */}
-          <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900/60 border border-slate-800/90 p-3 rounded-xl text-xs">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="flex items-center gap-1 text-slate-400 font-semibold mr-1">
-                <Filter className="w-3.5 h-3.5 text-cyan-400" />
-                <span>Filtri:</span>
-              </span>
-
-              {/* Station selector */}
-              <div className="flex items-center bg-slate-950 p-0.5 rounded-lg border border-slate-800 font-mono">
-                {(['all', 'iss', 'tiangong'] as const).map((st) => (
-                  <button
-                    key={st}
-                    type="button"
-                    onClick={() => setStationFilter(st)}
-                    className={`px-2.5 py-1 rounded-md transition ${
-                      stationFilter === st
-                        ? 'bg-cyan-500/20 text-cyan-300 font-bold'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {st === 'all' ? 'Tutte' : st === 'iss' ? 'ISS' : 'Tiangong'}
-                  </button>
-                ))}
+          {/* Collapsible Accordion for Upcoming Passes inside the Modal */}
+          <div className="rounded-2xl bg-slate-900/80 border border-slate-800 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setIsPassListOpen((prev) => !prev)}
+              className="w-full p-3.5 sm:px-5 sm:py-4 flex items-center justify-between gap-2 text-left hover:bg-slate-800/40 transition"
+            >
+              <div className="flex items-center gap-2.5 min-w-0">
+                <CalendarClock className="w-4 h-4 sm:w-5 sm:h-5 text-cyan-400 shrink-0" />
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-xs sm:text-sm font-bold text-white">
+                      {t.sightings.upcomingPassesList} ({computedPasses.length})
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[10px] font-mono font-bold">
+                      {t.sightings.nakedEyeCount.replace('{count}', String(nakedEyeCount))}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 truncate mt-0.5">
+                    {t.sightings.tapToToggle.replace(
+                      '{action}',
+                      isPassListOpen ? t.sightings.collapse : t.sightings.expand
+                    )}
+                  </p>
+                </div>
               </div>
 
-              {/* Visibility selector */}
-              <div className="flex items-center bg-slate-950 p-0.5 rounded-lg border border-slate-800 font-mono">
-                <button
-                  type="button"
-                  onClick={() => setVisibilityFilter('all')}
-                  className={`px-2.5 py-1 rounded-md transition ${
-                    visibilityFilter === 'all'
-                      ? 'bg-cyan-500/20 text-cyan-300 font-bold'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Tutti (Radio + Ottici)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setVisibilityFilter('naked_eye')}
-                  className={`px-2.5 py-1 rounded-md transition flex items-center gap-1 ${
-                    visibilityFilter === 'naked_eye'
-                      ? 'bg-amber-500/25 text-amber-300 font-bold'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  <Sparkles className="w-3 h-3 text-amber-400" />
-                  <span>Visibili a Occhio Nudo ({nakedEyeCount})</span>
-                </button>
+              <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-cyan-400 shrink-0">
+                <span>{isPassListOpen ? t.sightings.collapse : t.sightings.show}</span>
+                {isPassListOpen ? (
+                  <ChevronUp className="w-4 h-4" />
+                ) : (
+                  <ChevronDown className="w-4 h-4" />
+                )}
               </div>
-            </div>
+            </button>
 
-            {/* Horizon & Elevation Controls */}
-            <div className="flex flex-wrap items-center gap-3 font-mono">
-              <div className="flex items-center gap-1.5">
-                <span className="text-slate-400">Finestra:</span>
-                <select
-                  value={hoursAhead}
-                  onChange={(e) => setHoursAhead(Number(e.target.value))}
-                  className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-slate-200"
-                >
-                  <option value={24}>Prossime 24h</option>
-                  <option value={48}>Prossime 48h (2 giorni)</option>
-                  <option value={72}>Prossime 72h (3 giorni)</option>
-                  <option value={120}>Prossimi 5 giorni</option>
-                </select>
-              </div>
+            {isPassListOpen && (
+              <div className="p-3.5 sm:p-5 pt-2 border-t border-slate-800/80 space-y-3">
+                {/* Filter Bar */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-950/90 border border-slate-800 p-2.5 rounded-xl text-xs">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="hidden sm:flex items-center gap-1 text-slate-400 font-semibold mr-1">
+                      <Filter className="w-3.5 h-3.5 text-cyan-400" />
+                    </span>
 
-              <div className="flex items-center gap-1.5">
-                <span className="text-slate-400">Elev. Min:</span>
-                <select
-                  value={minElevation}
-                  onChange={(e) => setMinElevation(Number(e.target.value))}
-                  className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-slate-200"
-                >
-                  <option value={5}>&ge; 5° (Tutti)</option>
-                  <option value={10}>&ge; 10° (Consigliato)</option>
-                  <option value={25}>&ge; 25° (Passaggi Alti)</option>
-                  <option value={45}>&ge; 45° (Zenitali)</option>
-                </select>
-              </div>
-            </div>
-          </div>
+                    <div className="flex items-center bg-slate-900 p-0.5 rounded-lg border border-slate-800 font-mono">
+                      {(['all', 'iss', 'tiangong'] as const).map((st) => (
+                        <button
+                          key={st}
+                          type="button"
+                          onClick={() => setStationFilter(st)}
+                          className={`px-2 py-1 rounded-md text-[11px] transition ${
+                            stationFilter === st
+                              ? 'bg-cyan-500/20 text-cyan-300 font-bold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {st === 'all' ? t.sightings.allStations : st === 'iss' ? 'ISS' : 'Tiangong'}
+                        </button>
+                      ))}
+                    </div>
 
-          {/* Results List / Table */}
-          {computedPasses.length === 0 ? (
-            <div className="p-8 rounded-2xl bg-slate-950/80 border border-slate-800 text-center space-y-2">
-              <p className="text-sm text-slate-300 font-semibold">
-                Nessun avvistamento trovato con i filtri selezionati.
-              </p>
-              <p className="text-xs text-slate-400">
-                Prova ad estendere la finestra temporale a 72h/5 giorni, ridurre l'elevazione minima a 5° o selezionare "Tutti (Radio + Ottici)".
-              </p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/80">
-              <table className="w-full text-left border-collapse text-xs font-mono">
-                <thead>
-                  <tr className="bg-slate-900/95 border-b border-slate-800 text-slate-400 uppercase text-[11px]">
-                    <th className="py-3 px-3">Stazione</th>
-                    <th className="py-3 px-3">Data &amp; Countdown</th>
-                    <th className="py-3 px-3">Sorge (AOS)</th>
-                    <th className="py-3 px-3">Culmine (Max El)</th>
-                    <th className="py-3 px-3">Tramonta (LOS)</th>
-                    <th className="py-3 px-3">Durata</th>
-                    <th className="py-3 px-3">Visibilità &amp; Cielo</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800/70">
-                  {computedPasses.map((p) => {
-                    const isHigh = p.maxElevation >= 40;
-                    return (
-                      <tr
-                        key={p.id}
-                        className={`transition ${
-                          p.isVisuallyObservable
-                            ? 'bg-amber-500/5 hover:bg-amber-500/10'
-                            : 'hover:bg-slate-900/60'
+                    <div className="flex items-center bg-slate-900 p-0.5 rounded-lg border border-slate-800 font-mono">
+                      <button
+                        type="button"
+                        onClick={() => setVisibilityFilter('all')}
+                        className={`px-2 py-1 rounded-md text-[11px] transition ${
+                          visibilityFilter === 'all'
+                            ? 'bg-cyan-500/20 text-cyan-300 font-bold'
+                            : 'text-slate-400 hover:text-slate-200'
                         }`}
                       >
-                        {/* Station */}
-                        <td className="py-3 px-3 font-bold">
-                          <span
-                            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg ${
-                              p.stationId === 'iss'
-                                ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
-                                : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                        {t.sightings.allPasses}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setVisibilityFilter('naked_eye')}
+                        className={`px-2 py-1 rounded-md text-[11px] transition flex items-center gap-1 ${
+                          visibilityFilter === 'naked_eye'
+                            ? 'bg-amber-500/25 text-amber-300 font-bold'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        <Sparkles className="w-3 h-3 text-amber-400" />
+                        <span>{t.sightings.nakedEyeFilter.replace('{count}', String(nakedEyeCount))}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:flex items-center gap-2 font-mono text-[11px]">
+                    <select
+                      value={hoursAhead}
+                      onChange={(e) => setHoursAhead(Number(e.target.value))}
+                      className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-slate-200"
+                    >
+                      <option value={24}>{t.sightings.hours24}</option>
+                      <option value={48}>{t.sightings.hours48}</option>
+                      <option value={72}>{t.sightings.hours72}</option>
+                      <option value={120}>{t.sightings.days5}</option>
+                    </select>
+
+                    <select
+                      value={minElevation}
+                      onChange={(e) => setMinElevation(Number(e.target.value))}
+                      className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-slate-200"
+                    >
+                      <option value={5}>{t.sightings.elevGte.replace('{deg}', '5')}</option>
+                      <option value={10}>{t.sightings.elevGte.replace('{deg}', '10')}</option>
+                      <option value={25}>{t.sightings.elevGte.replace('{deg}', '25')}</option>
+                      <option value={45}>{t.sightings.elevGte.replace('{deg}', '45')}</option>
+                    </select>
+                  </div>
+                </div>
+
+                {computedPasses.length === 0 ? (
+                  <div className="p-5 rounded-xl bg-slate-950/80 border border-slate-800 text-center text-xs text-slate-400">
+                    {t.sightings.noPassesFound}
+                  </div>
+                ) : (
+                  <>
+                    {/* Mobile Compact Accordion Rows */}
+                    <div className="space-y-2 md:hidden">
+                      {computedPasses.map((p) => {
+                        const isHigh = p.maxElevation >= 40;
+                        const isItemOpen = expandedPassId === p.id;
+                        const isScheduled = scheduledPassIds.includes(p.id);
+                        return (
+                          <div
+                            key={p.id}
+                            className={`rounded-xl border font-mono text-xs overflow-hidden ${
+                              p.isVisuallyObservable
+                                ? 'bg-amber-950/15 border-amber-500/40'
+                                : 'bg-slate-950/90 border-slate-800'
                             }`}
                           >
-                            {p.stationName}
-                          </span>
-                        </td>
+                            <div className="w-full p-2.5 flex items-center justify-between gap-2">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedPassId((prev) => (prev === p.id ? null : p.id))
+                                }
+                                className="flex items-center gap-2 min-w-0 flex-1 text-left"
+                              >
+                                <span
+                                  className={`px-1.5 py-0.5 rounded font-bold text-[10px] shrink-0 ${
+                                    p.stationId === 'iss'
+                                      ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
+                                      : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                                  }`}
+                                >
+                                  {p.stationName}
+                                </span>
+                                <span className="text-white font-bold text-[11px] truncate">
+                                  {formatDate(p.aosTime, {
+                                    day: '2-digit',
+                                    month: '2-digit',
+                                  })}{' '}
+                                  {formatTime(p.aosTime)}
+                                </span>
+                                <span
+                                  className={`font-bold text-[11px] ${
+                                    isHigh ? 'text-emerald-300' : 'text-cyan-300'
+                                  }`}
+                                >
+                                  {p.maxElevation.toFixed(0)}°
+                                </span>
+                              </button>
 
-                        {/* Date & Countdown */}
-                        <td className="py-3 px-3">
-                          <div className="text-white font-semibold">
-                            {p.aosTime.toLocaleDateString('it-IT', {
-                              weekday: 'short',
-                              day: '2-digit',
-                              month: 'short',
-                            })}
-                          </div>
-                          <div className="text-[11px] text-cyan-400">
-                            {formatTimeUntil(p.aosTime)}
-                          </div>
-                        </td>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                {p.isVisuallyObservable && (
+                                  <Eye className="w-3.5 h-3.5 text-amber-400" />
+                                )}
+                                <span className="text-[10px] text-cyan-400">
+                                  {formatTimeUntil(p.aosTime)}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => onTogglePassReminder(p)}
+                                  className={`p-1.5 rounded-lg border transition ${
+                                    isScheduled
+                                      ? 'bg-amber-500/25 border-amber-400/60 text-amber-300'
+                                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+                                  }`}
+                                  title={t.sightings.notifyMePush}
+                                >
+                                  {isScheduled ? (
+                                    <BellRing className="w-3.5 h-3.5 text-amber-400" />
+                                  ) : (
+                                    <Bell className="w-3.5 h-3.5" />
+                                  )}
+                                </button>
+                              </div>
+                            </div>
 
-                        {/* AOS */}
-                        <td className="py-3 px-3">
-                          <div className="text-slate-100 font-semibold">
-                            {p.aosTime.toLocaleTimeString('it-IT', {
-                              hour: '2-digit',
-                              minute: '2-digit',
-                              second: '2-digit',
-                            })}
-                          </div>
-                          <div className="text-[11px] text-slate-400">
-                            Az {Math.round(p.aosAzimuth)}° ({azimuthToCompass(p.aosAzimuth)})
-                          </div>
-                        </td>
+                            {isItemOpen && (
+                              <div className="px-2.5 pb-2.5 pt-1.5 border-t border-slate-800/80 space-y-2">
+                                <div className="grid grid-cols-3 gap-1.5 text-center">
+                                  <div className="bg-slate-900/80 p-1.5 rounded-lg">
+                                    <div className="text-[10px] text-slate-400">{t.sightings.riseAos}</div>
+                                    <div className="text-white font-bold">
+                                      {formatTime(p.aosTime)}
+                                    </div>
+                                    <div className="text-[10px] text-slate-400">
+                                      {Math.round(p.aosAzimuth)}° ({getCompassDirection(p.aosAzimuth)})
+                                    </div>
+                                  </div>
 
-                        {/* Max Elevation */}
-                        <td className="py-3 px-3">
-                          <div className="flex items-center gap-1.5">
-                            <Compass
-                              className={`w-3.5 h-3.5 ${
-                                isHigh ? 'text-emerald-400' : 'text-cyan-400'
-                              }`}
-                            />
-                            <span
-                              className={`text-sm font-bold ${
-                                isHigh ? 'text-emerald-300' : 'text-cyan-300'
-                              }`}
-                            >
-                              {p.maxElevation.toFixed(1)}°
-                            </span>
-                            {isHigh && (
-                              <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 text-[10px] border border-emerald-500/30">
-                                ALTO
-                              </span>
+                                  <div className="bg-slate-900/80 p-1.5 rounded-lg border border-slate-800">
+                                    <div className="text-[10px] text-slate-400">{t.sightings.peak}</div>
+                                    <div
+                                      className={`font-bold text-sm ${
+                                        isHigh ? 'text-emerald-300' : 'text-cyan-300'
+                                      }`}
+                                    >
+                                      {p.maxElevation.toFixed(1)}°
+                                    </div>
+                                    <div className="text-[10px] text-slate-400">
+                                      {Math.floor(p.durationSeconds / 60)}m {p.durationSeconds % 60}s
+                                    </div>
+                                  </div>
+
+                                  <div className="bg-slate-900/80 p-1.5 rounded-lg">
+                                    <div className="text-[10px] text-slate-400">{t.sightings.setLos}</div>
+                                    <div className="text-white font-bold">
+                                      {formatTime(p.losTime)}
+                                    </div>
+                                    <div className="text-[10px] text-slate-400">
+                                      {Math.round(p.losAzimuth)}° ({getCompassDirection(p.losAzimuth)})
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
                             )}
                           </div>
-                          <div className="text-[11px] text-slate-400">
-                            {p.maxElTime.toLocaleTimeString('it-IT', {
-                              hour: '2-digit',
-                              minute: '2-digit',
-                            })}{' '}
-                            • {azimuthToCompass(p.maxAzimuth)}
-                          </div>
-                        </td>
+                        );
+                      })}
+                    </div>
 
-                        {/* LOS */}
-                        <td className="py-3 px-3">
-                          <div className="text-slate-200">
-                            {p.losTime.toLocaleTimeString('it-IT', {
-                              hour: '2-digit',
-                              minute: '2-digit',
-                              second: '2-digit',
-                            })}
-                          </div>
-                          <div className="text-[11px] text-slate-400">
-                            Az {Math.round(p.losAzimuth)}° ({azimuthToCompass(p.losAzimuth)})
-                          </div>
-                        </td>
-
-                        {/* Duration */}
-                        <td className="py-3 px-3 text-slate-300">
-                          {Math.floor(p.durationSeconds / 60)}m {p.durationSeconds % 60}s
-                        </td>
-
-                        {/* Sky & Sighting Quality */}
-                        <td className="py-3 px-3">
-                          {p.skyQuality === 'naked_eye' ? (
-                            <div className="inline-flex flex-col gap-0.5">
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-400/40 font-bold text-[11px]">
-                                <Eye className="w-3.5 h-3.5 text-amber-400" />
-                                <span>Visibile a Occhio Nudo</span>
-                              </span>
-                              <span className="text-[10px] text-slate-400">
-                                Stazione al Sole • Cielo buio (Sole {p.observerSunElevationDeg.toFixed(0)}°)
-                              </span>
-                            </div>
-                          ) : p.skyQuality === 'daylight_or_bright_twilight' ? (
-                            <div className="inline-flex flex-col gap-0.5">
-                              <span className="inline-flex items-center gap-1 text-sky-300 text-[11px]">
-                                <Sun className="w-3.5 h-3.5 text-amber-400" />
-                                <Radio className="w-3.5 h-3.5 text-sky-400" />
-                                <span>Diurno (Ascolto Radio)</span>
-                              </span>
-                              <span className="text-[10px] text-slate-400">
-                                Cielo chiaro (Sole +{p.observerSunElevationDeg.toFixed(0)}°)
-                              </span>
-                            </div>
-                          ) : (
-                            <div className="inline-flex flex-col gap-0.5">
-                              <span className="inline-flex items-center gap-1 text-slate-400 text-[11px]">
-                                <Moon className="w-3.5 h-3.5 text-indigo-400" />
-                                <Radio className="w-3.5 h-3.5 text-cyan-400" />
-                                <span>In Eclissi (Solo Radio)</span>
-                              </span>
-                              <span className="text-[10px] text-slate-500">
-                                Cono d'ombra terrestre
-                              </span>
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
+                    {/* Desktop Table View */}
+                    <div className="hidden md:block overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/80">
+                      <table className="w-full text-left border-collapse text-xs font-mono">
+                        <thead>
+                          <tr className="bg-slate-900/95 border-b border-slate-800 text-slate-400 uppercase text-[11px]">
+                            <th className="py-2.5 px-3">{t.passes.station}</th>
+                            <th className="py-2.5 px-3">{t.sightings.dateAndCountdown}</th>
+                            <th className="py-2.5 px-3">{t.sightings.riseAos}</th>
+                            <th className="py-2.5 px-3">{t.passes.peakMaxEl}</th>
+                            <th className="py-2.5 px-3">{t.sightings.setLos}</th>
+                            <th className="py-2.5 px-3">{t.passes.duration}</th>
+                            <th className="py-2.5 px-3">{t.sightings.visibility}</th>
+                            <th className="py-2.5 px-3 text-right">{t.passes.notification}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70">
+                          {computedPasses.map((p) => {
+                            const isHigh = p.maxElevation >= 40;
+                            const isScheduled = scheduledPassIds.includes(p.id);
+                            return (
+                              <tr
+                                key={p.id}
+                                className={`transition ${
+                                  p.isVisuallyObservable
+                                    ? 'bg-amber-500/5 hover:bg-amber-500/10'
+                                    : 'hover:bg-slate-900/60'
+                                }`}
+                              >
+                                <td className="py-2.5 px-3 font-bold">
+                                  <span
+                                    className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${
+                                      p.stationId === 'iss'
+                                        ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
+                                        : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                                    }`}
+                                  >
+                                    {p.stationName}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="text-white font-semibold">
+                                    {formatDate(p.aosTime, {
+                                      weekday: 'short',
+                                      day: '2-digit',
+                                      month: 'short',
+                                    })}
+                                  </div>
+                                  <div className="text-[11px] text-cyan-400">
+                                    {formatTimeUntil(p.aosTime)}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="text-slate-100 font-semibold">
+                                    {formatTime(p.aosTime)}
+                                  </div>
+                                  <div className="text-[11px] text-slate-400">
+                                    Az {Math.round(p.aosAzimuth)}° ({getCompassDirection(p.aosAzimuth)})
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="flex items-center gap-1.5">
+                                    <Compass
+                                      className={`w-3.5 h-3.5 ${
+                                        isHigh ? 'text-emerald-400' : 'text-cyan-400'
+                                      }`}
+                                    />
+                                    <span
+                                      className={`text-sm font-bold ${
+                                        isHigh ? 'text-emerald-300' : 'text-cyan-300'
+                                      }`}
+                                    >
+                                      {p.maxElevation.toFixed(1)}°
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-slate-400">
+                                    {getCompassDirection(p.maxAzimuth)}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="text-slate-200">
+                                    {formatTime(p.losTime)}
+                                  </div>
+                                  <div className="text-[11px] text-slate-400">
+                                    Az {Math.round(p.losAzimuth)}° ({getCompassDirection(p.losAzimuth)})
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3 text-slate-300">
+                                  {Math.floor(p.durationSeconds / 60)}m {p.durationSeconds % 60}s
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  {p.skyQuality === 'naked_eye' ? (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-400/40 font-bold text-[11px]">
+                                      <Eye className="w-3.5 h-3.5 text-amber-400" />
+                                      <span>{t.common.nakedEye}</span>
+                                    </span>
+                                  ) : p.skyQuality === 'daylight_or_bright_twilight' ? (
+                                    <span className="inline-flex items-center gap-1 text-sky-300 text-[11px]">
+                                      <Sun className="w-3.5 h-3.5 text-amber-400" />
+                                      <span>{t.passes.daylightRadio}</span>
+                                    </span>
+                                  ) : (
+                                    <span className="inline-flex items-center gap-1 text-slate-400 text-[11px]">
+                                      <Moon className="w-3.5 h-3.5 text-indigo-400" />
+                                      <Radio className="w-3.5 h-3.5 text-cyan-400" />
+                                      <span>{t.passes.eclipseRadio}</span>
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3 text-right">
+                                  <button
+                                    type="button"
+                                    onClick={() => onTogglePassReminder(p)}
+                                    className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[11px] font-bold transition ${
+                                      isScheduled
+                                        ? 'bg-amber-500/20 border-amber-400/60 text-amber-200'
+                                        : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-300'
+                                    }`}
+                                    title={
+                                      isScheduled
+                                        ? t.passes.removeReminderTitle
+                                        : t.passes.setReminderTitle
+                                    }
+                                  >
+                                    {isScheduled ? (
+                                      <BellRing className="w-3.5 h-3.5 text-amber-400" />
+                                    ) : (
+                                      <Bell className="w-3.5 h-3.5 text-slate-400" />
+                                    )}
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* Modal Footer */}
-        <div className="px-4 sm:px-6 py-3 bg-slate-950 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
-          <div className="flex items-center gap-2">
-            <Sparkles className="w-4 h-4 text-amber-400" />
-            <span>
-              <strong>Visibile a Occhio Nudo</strong>: la stazione riflette la luce solare mentre il cielo dell'osservatore è in crepuscolo o notte. Tutti i passaggi sono sempre validi per l'<strong>ascolto radio VHF/UHF</strong>!
-            </span>
-          </div>
+        {/* 3. Fixed Modal Footer */}
+        <div className="px-4 sm:px-6 py-3 bg-slate-950 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-400 shrink-0">
           <button
-            onClick={onClose}
-            className="px-4 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-semibold transition"
+            type="button"
+            onClick={() => {
+              onClose();
+              onOpenNotificationsModal();
+            }}
+            className="w-full sm:w-auto px-3.5 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-200 font-mono font-bold flex items-center justify-center gap-1.5 transition"
           >
-            Chiudi
+            <BellRing className="w-3.5 h-3.5 text-amber-400" />
+            <span>{t.sightings.pushSettings}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-full sm:w-auto px-5 py-2 sm:py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-semibold transition"
+          >
+            {t.sightings.close}
           </button>
         </div>
       </div>
     </div>
   );
+
+  return createPortal(modalContent, document.body);
 };
